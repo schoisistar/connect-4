@@ -379,7 +379,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className="layout">
+      <div className={`layout ${showEvaluation ? "has-eval" : ""}`}>
         {showEvaluation && (
           <aside className="evaluation">
             <div className="evaluation-bar" aria-label="Position evaluation">
@@ -521,8 +521,7 @@ export default function App() {
             <ol className="history-list">
               {history.map((move, index) => (
                 <li key={`${move.player}-${index}`}>
-                  {index + 1}. {playerLabel(move.player)} to column{" "}
-                  {move.col + 1}
+                  {playerLabel(move.player)} to column {move.col + 1}
                 </li>
               ))}
             </ol>
