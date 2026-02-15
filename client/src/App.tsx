@@ -1,4 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+
+import {
+  type GameState,
+  type PlayerId,
+  type RoomCode,
+  type ServerToClient,
+  RoomCodeSchema,
+  serializeServerMessage
+} from "@connect-4/shared";
 
 type Player = 1 | 2;
 
@@ -65,7 +74,7 @@ const isBoardFull = (board: number[][]) =>
 
 const playerLabel = (player: Player) => (player === 1 ? "Red" : "Yellow");
 
-type GameMode = "local" | "computer";
+type GameMode = "local" | "computer" | "online";
 type Difficulty = "easy" | "medium" | "hard";
 type ColorChoice = "red" | "yellow";
 
@@ -242,10 +251,7 @@ const chooseComputerMove = (
   if (winningMove !== null) return winningMove;
 
   if (difficulty === "medium") {
-    const blockMove = findWinningMove(
-      board,
-      computerPlayer === 1 ? 2 : 1
-    );
+    const blockMove = findWinningMove(board, computerPlayer === 1 ? 2 : 1);
     return blockMove ?? pickRandom(valid);
   }
 
@@ -256,6 +262,36 @@ const chooseComputerMove = (
   return col ?? pickRandom(valid);
 };
 
+function wsUrlFromWindow(): string {
+  const env = (import.meta as any).env?.VITE_WS_URL as string | undefined;
+  if (env) return env;
+
+  // Default: assume WS server on same host, port 8787
+  const proto = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${proto}://${window.location.hostname}:8787`;
+}
+
+function roomCodeFromUrl(): string | null {
+  const url = new URL(window.location.href);
+  return url.searchParams.get("room");
+}
+
+function setRoomCodeInUrl(roomCode: string) {
+  const url = new URL(window.location.href);
+  url.searchParams.set("room", roomCode);
+  window.history.replaceState({}, "", url.toString());
+}
+
+function clearRoomCodeFromUrl() {
+  const url = new URL(window.location.href);
+  url.searchParams.delete("room");
+  window.history.replaceState({}, "", url.toString());
+}
+
+function playerIdToPlayer(p: PlayerId): Player {
+  return p === "P1" ? 1 : 2;
+}
+
 export default function App() {
   const [board, setBoard] = useState<number[][]>(createBoard);
   const [currentPlayer, setCurrentPlayer] = useState<Player>(1);
@@ -264,9 +300,20 @@ export default function App() {
   const [mode, setMode] = useState<GameMode>("local");
   const [difficulty, setDifficulty] = useState<Difficulty>("medium");
   const [colorChoice, setColorChoice] = useState<ColorChoice>("red");
-  const [isComputerThinking, setIsComputerThinking] = useState(false);
   const [history, setHistory] = useState<Move[]>([]);
   const [showEvaluation, setShowEvaluation] = useState(false);
+
+  // Online state
+  const socketRef = useRef<WebSocket | null>(null);
+  const [onlineRoomCodeInput, setOnlineRoomCodeInput] = useState("");
+  const [onlineRoomCode, setOnlineRoomCode] = useState<RoomCode | null>(null);
+  const [onlineYou, setOnlineYou] = useState<PlayerId | null>(null);
+  const [onlineState, setOnlineState] = useState<GameState | null>(null);
+  const [onlineStatus, setOnlineStatus] = useState<
+    "idle" | "connecting" | "connected" | "error"
+  >("idle");
+  const [onlineError, setOnlineError] = useState<string | null>(null);
+
   const humanPlayer: Player = colorChoice === "red" ? 1 : 2;
   const computerPlayer: Player = humanPlayer === 1 ? 2 : 1;
 
@@ -282,7 +329,25 @@ export default function App() {
     return normalized;
   }, [board, showEvaluation]);
 
+  const onlineInviteLink = useMemo(() => {
+    if (!onlineRoomCode) return null;
+    const url = new URL(window.location.href);
+    url.searchParams.set("room", onlineRoomCode);
+    return url.toString();
+  }, [onlineRoomCode]);
+
   const handleDrop = (col: number) => {
+    if (mode === "online") {
+      if (!onlineRoomCode || !onlineYou || !socketRef.current) return;
+      if (!onlineState) return;
+      if (onlineState.status !== "playing") return;
+      if (onlineState.nextTurn !== onlineYou) return;
+      socketRef.current.send(
+        JSON.stringify({ type: "make_move", roomCode: onlineRoomCode, col })
+      );
+      return;
+    }
+
     if (winner || isDraw) return;
     if (mode === "computer" && currentPlayer === computerPlayer) return;
 
@@ -305,15 +370,157 @@ export default function App() {
     }
   };
 
-  const resetGame = () => {
+  const resetLocalGame = () => {
     setBoard(createBoard());
     setCurrentPlayer(1);
     setWinner(null);
     setIsDraw(false);
-    setIsComputerThinking(false);
     setHistory([]);
   };
 
+  function disconnectOnline() {
+    try {
+      socketRef.current?.close();
+    } catch {
+      // ignore
+    }
+    socketRef.current = null;
+    setOnlineStatus("idle");
+    setOnlineError(null);
+    setOnlineRoomCode(null);
+    setOnlineYou(null);
+    setOnlineState(null);
+    clearRoomCodeFromUrl();
+  }
+
+  function ensureSocket(): WebSocket {
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      return socketRef.current;
+    }
+
+    const url = wsUrlFromWindow();
+    const ws = new WebSocket(url);
+    socketRef.current = ws;
+    setOnlineStatus("connecting");
+    setOnlineError(null);
+
+    ws.onopen = () => {
+      setOnlineStatus("connected");
+      setOnlineError(null);
+    };
+
+    ws.onclose = () => {
+      setOnlineStatus("idle");
+    };
+
+    ws.onerror = () => {
+      setOnlineStatus("error");
+      setOnlineError("WebSocket error");
+    };
+
+    ws.onmessage = (ev) => {
+      let data: any;
+      try {
+        data = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+
+      const msg = data as ServerToClient;
+
+      if (msg.type === "room_created") {
+        setOnlineRoomCode(msg.roomCode as RoomCode);
+        setOnlineYou(msg.you.playerId as PlayerId);
+        setOnlineError(null);
+        setOnlineState(null);
+        setRoomCodeInUrl(msg.roomCode);
+      } else if (msg.type === "room_joined") {
+        setOnlineRoomCode(msg.roomCode as RoomCode);
+        setOnlineYou(msg.you.playerId as PlayerId);
+        setOnlineState(msg.state as GameState);
+        setOnlineError(null);
+        setRoomCodeInUrl(msg.roomCode);
+      } else if (msg.type === "state") {
+        setOnlineState(msg.state as GameState);
+      } else if (msg.type === "error") {
+        setOnlineError(msg.message);
+      }
+    };
+
+    return ws;
+  }
+
+  function createOnlineRoom() {
+    const ws = ensureSocket();
+    const sendCreate = () => ws.send(JSON.stringify({ type: "create_room" }));
+    if (ws.readyState === WebSocket.OPEN) sendCreate();
+    else ws.addEventListener("open", sendCreate, { once: true });
+
+    setMode("online");
+    resetLocalGame();
+  }
+
+  function joinOnlineRoom(codeRaw: string) {
+    const code = codeRaw.trim().toUpperCase();
+    const parsed = RoomCodeSchema.safeParse(code);
+    if (!parsed.success) {
+      setOnlineError("Invalid room code");
+      return;
+    }
+
+    const ws = ensureSocket();
+    const sendJoin = () =>
+      ws.send(JSON.stringify({ type: "join_room", roomCode: parsed.data }));
+    if (ws.readyState === WebSocket.OPEN) sendJoin();
+    else ws.addEventListener("open", sendJoin, { once: true });
+
+    setMode("online");
+    resetLocalGame();
+  }
+
+  // Auto-join via invite link (?room=CODE)
+  useEffect(() => {
+    const code = roomCodeFromUrl();
+    if (!code) return;
+    joinOnlineRoom(code);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Reflect server state into UI board/winner/draw/history
+  useEffect(() => {
+    if (mode !== "online") return;
+    if (!onlineState) return;
+
+    const b = (onlineState.board as unknown as number[][]) ?? createBoard();
+    setBoard(b);
+
+    if (onlineState.status === "won" && onlineState.winner) {
+      setWinner({ player: playerIdToPlayer(onlineState.winner), cells: [] });
+      setIsDraw(false);
+    } else {
+      setWinner(null);
+      setIsDraw(onlineState.status === "draw");
+    }
+
+    setCurrentPlayer(playerIdToPlayer(onlineState.nextTurn));
+
+    // Keep a lightweight history from lastMove
+    if (onlineState.lastMove) {
+      setHistory((prev) => {
+        const last = prev[prev.length - 1];
+        const m = onlineState.lastMove!;
+        const next = {
+          player: playerIdToPlayer(m.by),
+          row: m.row,
+          col: m.col
+        };
+        if (last && last.row === next.row && last.col === next.col) return prev;
+        return [...prev, next];
+      });
+    }
+  }, [mode, onlineState]);
+
+  // Computer mode effect (unchanged)
   useEffect(() => {
     if (mode !== "computer") return;
     if (winner || isDraw) return;
@@ -324,7 +531,6 @@ export default function App() {
     const row = getAvailableRow(board, move);
     if (row < 0) return;
 
-    setIsComputerThinking(true);
     const timer = window.setTimeout(() => {
       const nextBoard = applyMove(board, move, computerPlayer);
       if (!nextBoard) return;
@@ -337,7 +543,6 @@ export default function App() {
       setIsDraw(nextDraw);
       setHistory((prev) => [...prev, { player: computerPlayer, row, col: move }]);
       setCurrentPlayer(humanPlayer);
-      setIsComputerThinking(false);
     }, 400);
 
     return () => window.clearTimeout(timer);
@@ -352,21 +557,41 @@ export default function App() {
     winner
   ]);
 
+  const headerTitle = mode === "online" ? "Online Play" : "Local Play";
+
   return (
     <div className="app">
       <header className="header">
         <div>
           <p className="eyebrow">Connect 4</p>
-          <h1>Local Play</h1>
+          <h1>{headerTitle}</h1>
           <p className="subtext">
             Drop tokens into columns and connect four in a row, column, or diagonal.
           </p>
         </div>
         <div className="status">
-          {winner ? (
-            <span className="status-pill winner">
-              {playerLabel(winner.player)} wins
-            </span>
+          {mode === "online" ? (
+            onlineState?.status === "won" && onlineState.winner ? (
+              <span className="status-pill winner">
+                {onlineState.winner === "P1" ? "Red" : "Yellow"} wins
+              </span>
+            ) : onlineState?.status === "draw" ? (
+              <span className="status-pill draw">Draw</span>
+            ) : onlineState?.status === "waiting" ? (
+              <span className="status-pill draw">Waiting for opponent…</span>
+            ) : onlineState?.status === "playing" ? (
+              <span
+                className={`status-pill player-${
+                  onlineState.nextTurn === "P1" ? 1 : 2
+                }`}
+              >
+                {onlineState.nextTurn === "P1" ? "Red" : "Yellow"} to move
+              </span>
+            ) : (
+              <span className="status-pill draw">Connecting…</span>
+            )
+          ) : winner ? (
+            <span className="status-pill winner">{playerLabel(winner.player)} wins</span>
           ) : isDraw ? (
             <span className="status-pill draw">Draw</span>
           ) : mode === "computer" && currentPlayer === computerPlayer ? (
@@ -403,6 +628,7 @@ export default function App() {
             </div>
           </aside>
         )}
+
         <div className="main">
           <section className="board" role="grid">
             {board.map((row, rowIndex) => (
@@ -410,9 +636,6 @@ export default function App() {
                 {row.map((cell, colIndex) => {
                   const tokenClass =
                     cell === 0 ? "" : cell === 1 ? "token red" : "token yellow";
-                  const winnerClass = winningCells.has(`${rowIndex}-${colIndex}`)
-                    ? "winner-cell"
-                    : "";
                   const lastMove = history[history.length - 1];
                   const lastMoveClass =
                     lastMove &&
@@ -425,7 +648,7 @@ export default function App() {
                     <button
                       key={`cell-${rowIndex}-${colIndex}`}
                       type="button"
-                      className={`cell ${winnerClass} ${lastMoveClass}`}
+                      className={`cell ${lastMoveClass}`}
                       onClick={() => handleDrop(colIndex)}
                       aria-label={`Drop in column ${colIndex + 1}`}
                     >
@@ -448,27 +671,33 @@ export default function App() {
                 onChange={(event) => {
                   const nextMode = event.target.value as GameMode;
                   setMode(nextMode);
-                  resetGame();
+                  setOnlineError(null);
+                  setOnlineState(null);
+                  setOnlineRoomCode(null);
+                  setOnlineYou(null);
+                  if (nextMode !== "online") disconnectOnline();
+                  resetLocalGame();
                 }}
               >
                 <option value="local">Local 2P</option>
                 <option value="computer">Vs Computer</option>
+                <option value="online">Online (Invite link)</option>
               </select>
+
               <label className="select-label" htmlFor="difficulty-select">
                 Difficulty
               </label>
               <select
                 id="difficulty-select"
                 value={difficulty}
-                onChange={(event) =>
-                  setDifficulty(event.target.value as Difficulty)
-                }
+                onChange={(event) => setDifficulty(event.target.value as Difficulty)}
                 disabled={mode !== "computer"}
               >
                 <option value="easy">Easy</option>
                 <option value="medium">Medium</option>
                 <option value="hard">Hard</option>
               </select>
+
               <label className="select-label" htmlFor="color-select">
                 You play
               </label>
@@ -477,13 +706,14 @@ export default function App() {
                 value={colorChoice}
                 onChange={(event) => {
                   setColorChoice(event.target.value as ColorChoice);
-                  resetGame();
+                  resetLocalGame();
                 }}
                 disabled={mode !== "computer"}
               >
                 <option value="red">Red</option>
                 <option value="yellow">Yellow</option>
               </select>
+
               <label className="select-label" htmlFor="eval-toggle">
                 Eval bar
               </label>
@@ -496,9 +726,68 @@ export default function App() {
                 {showEvaluation ? "On" : "Off"}
               </button>
             </div>
-            <button type="button" className="reset" onClick={resetGame}>
+
+            <button
+              type="button"
+              className="reset"
+              onClick={() => {
+                if (mode === "online") {
+                  // For now, easiest reset is: disconnect and let users create/join again.
+                  disconnectOnline();
+                }
+                resetLocalGame();
+              }}
+            >
               Reset board
             </button>
+
+            {mode === "online" && (
+              <div style={{ marginTop: 12 }}>
+                <div style={{ fontSize: 12, opacity: 0.85 }}>
+                  WS: {wsUrlFromWindow()} · Status: {onlineStatus}
+                </div>
+                {onlineYou && (
+                  <div style={{ fontSize: 12, opacity: 0.85 }}>
+                    You are: {onlineYou === "P1" ? "Red" : "Yellow"}
+                  </div>
+                )}
+                {onlineInviteLink && (
+                  <div style={{ marginTop: 8 }}>
+                    <div style={{ fontSize: 12, opacity: 0.85 }}>Invite link</div>
+                    <input
+                      type="text"
+                      readOnly
+                      value={onlineInviteLink}
+                      style={{ width: "100%" }}
+                      onFocus={(e) => e.currentTarget.select()}
+                    />
+                  </div>
+                )}
+                {onlineError && (
+                  <div style={{ marginTop: 8, color: "#ff6b6b", fontSize: 12 }}>
+                    {onlineError}
+                  </div>
+                )}
+                <div className="online-form" style={{ marginTop: 10 }}>
+                  <input
+                    type="text"
+                    placeholder="Room code"
+                    value={onlineRoomCodeInput}
+                    onChange={(e) => setOnlineRoomCodeInput(e.target.value)}
+                  />
+                  <button type="button" onClick={() => joinOnlineRoom(onlineRoomCodeInput)}>
+                    Join
+                  </button>
+                  <button type="button" onClick={createOnlineRoom}>
+                    Create room
+                  </button>
+                  <button type="button" onClick={disconnectOnline}>
+                    Leave
+                  </button>
+                </div>
+              </div>
+            )}
+
             <div className="legend">
               <span className="legend-item">
                 <span className="legend-dot red" /> Red
@@ -529,29 +818,14 @@ export default function App() {
         </aside>
       </div>
 
-      <section className="online">
-        <div>
-          <h2>Online Play (Coming Soon)</h2>
-          <p>
-            You will be able to share an invite key to play over the internet. The
-            server scaffolding is ready for WebSocket rooms.
-          </p>
-        </div>
-        <div className="online-form">
-          <input
-            type="text"
-            placeholder="Invite key"
-            disabled
-            aria-disabled="true"
-          />
-          <button type="button" disabled>
-            Join
-          </button>
-          <button type="button" disabled>
-            Create room
-          </button>
-        </div>
-      </section>
+      {mode !== "online" && (
+        <section className="online">
+          <div>
+            <h2>Online Play</h2>
+            <p>Switch the mode to “Online (Invite link)” to play over the internet.</p>
+          </div>
+        </section>
+      )}
     </div>
   );
 }
